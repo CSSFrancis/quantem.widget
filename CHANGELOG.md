@@ -6,6 +6,45 @@ new `rcN` heading when that rc is published to TestPyPI.
 
 ## Unreleased
 
+## rc41 - 2026-10-09
+
+- Show4DSTEM opens `.qem` acquisitions in the browser with no kernel:
+  `show4dstem.export.write_qem_bundle(paths, folder)` or `quantem show4dstem
+  a.qem b.qem --html` writes a WebGPU folder that streams each file by HTTP
+  range (or takes the files from the picker or a dropped folder when opened
+  from disk), keeps the counts encoded on the GPU and paints each panel as
+  soon as its acquisition is resident, with a loading tile and a status line
+  for the rest. Hovering a panel reads its exact count. A small rect or ring
+  detector now moves when pressed at its center, an HDF5 viewer folder can be
+  dropped on the offline viewer, and the viewer's range server keeps
+  connections alive, answers HEAD without a body and sends files with
+  `sendfile`.
+- Static renders match the browser. `Show2D.save_image` keeps negative values
+  in log scale, marks its log colorbar "log" and falls back to the data window
+  when the 2-98% Auto window collapses, as the preview does. Every static
+  render windows log scale from the data range and paints NaN, inf and an
+  empty window as the browser does; the Show3D export is no longer dark.
+- `Plot2D.save` works (it raised AttributeError); new `Plot2D.state_dict()`
+  and `load_state_dict(file or dict)`, which refuses another widget's file and
+  bad color limits.
+- Show4DSTEM and ShowDiffraction raise TypeError naming a removed or unknown
+  keyword, as Show1D and Show2D do (before: a warning, and
+  `compare_panel_gap_px=0` did nothing).
+- No anywidget "Direct export of a 'render'" deprecation warning in the
+  browser console: every widget bundle is a default export.
+- `[cuda]` and `[mps]` require `quantem.gpu>=0.0.1rc15,<0.0.1rc16`, the release this one
+  was tested with. CI, the docs and the
+  release bundle the one quantem.gpu ref in `gpu-ref.txt` (`gpu-v0.0.1rc15`);
+  the wheel carries `static/engine-manifest.json` (ref, commit, sha256 per
+  file) and `quantem.widget.profile()` prints its `webgpu kernels` line.
+  Building any bundle needs that quantem.gpu source: the display engine
+  validates borrowed count images with quantem.gpu's one definition.
+- The docs build without warnings: API pages drop removed keywords and
+  methods, export claims match each widget's signature, and the unused
+  sphinx-thebe script is gone.
+
+## rc40 - 2026-10-08
+
 - Fixes from the final cross-platform round. `quantem show4dstem --html` packs
   counts above 255 as uint16 by default (`--dtype auto`) instead of clipping
   them to uint8, and says so; `--out` is the output folder and a file name is
@@ -136,12 +175,11 @@ new `rcN` heading when that rc is published to TestPyPI.
   model, so a refusal (a file above the memory ceiling, a bad argument) leaves
   no model in the frontend.
 - Windows on ARM: `pip install "quantem.widget[cpu]"` no longer builds
-  hdf5plugin from source. `hdf5plugin` and `imageio-ffmpeg` (no ARM64 wheels)
-  are skipped there and `ncempy` stays below 1.15, which requires hdf5plugin.
-  Show4DSTEM imports and reads `.npy` and gzip or uncompressed HDF5 without it;
-  a compressed master raises an error naming hdf5plugin and the x64 Python
-  route, and `save_mp4` names the missing ffmpeg. `read_image` registers
-  hdf5plugin's filters itself for EMD files. The `[cuda]` hint appears only with
+  hdf5plugin from source. `hdf5plugin` (no ARM64 wheel) is skipped there and
+  `ncempy` stays below 1.15, which requires hdf5plugin. Show4DSTEM imports and
+  reads `.npy` and gzip or uncompressed HDF5 without it; a compressed master
+  raises an error naming hdf5plugin and the x64 Python route. `read_image`
+  registers hdf5plugin's filters itself for EMD files. The `[cuda]` hint appears only with
   an NVIDIA GPU, `[mps]` only on an Apple silicon Mac. WebGPU adapter requests
   leave out `powerPreference` on Windows, where Chromium ignores it and logs a
   warning. Install notes: `docs/install.md#windows`.

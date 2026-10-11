@@ -29,15 +29,17 @@ shows which one is active (`WebGPU` or `CPU` in the title row).
 Science kernels belong to `quantem.gpu`.
 [`scripts/sync-gpu-webgpu.mjs`](https://github.com/electronmicroscopy/quantem.widget/blob/main/scripts/sync-gpu-webgpu.mjs)
 copies its `detector/`, `dpc/`, `formats/`, `io/` and `ssb/` sources into
-`js/.generated/engine/` for the two bundles that use them, `show4dstem` and
-`showptycho`. Building those bundles needs the quantem.gpu source (set
-`QUANTEM_GPU_SRC=/path/to/quantem.gpu/src`, or install quantem.gpu in the Python
-named by `PYTHON`); without it the build stops and names `QUANTEM_GPU_SRC`.
-Every other bundle builds from widget source alone:
-
-```bash
-npm run build -- show2d show3d
-```
+`js/.generated/engine/`. `show4dstem` and `showptycho` bundle those kernels, and
+`js/display/borrowedImage.ts` re-exports quantem.gpu's borrowed count-image
+contract (`detector/webgpu/borrowed-image.ts`), so every bundle that draws
+through `js/display/` reads that tree too. Every build therefore needs the
+quantem.gpu source at the ref named in `gpu-ref.txt`, the one CI, the docs and
+the release check out (set `QUANTEM_GPU_SRC=/path/to/quantem.gpu/src`, or
+install quantem.gpu in the Python named by `PYTHON`); without it the build stops
+and names `QUANTEM_GPU_SRC`. The sync prints the source and commit it copied,
+and writes `js/.generated/engine/MANIFEST.json` (the ref, the commit and a
+sha256 per file); the wheel carries it as `static/engine-manifest.json` and
+`quantem.widget.profile()` prints its ref.
 
 Always edit science kernels in `quantem.gpu`, never the generated copy.
 
@@ -115,7 +117,7 @@ Use the existing frontend infrastructure:
 |---|---|
 | [`js/theme.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/theme.ts) | widget themes and host environment |
 | [`js/format.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/format.ts) | trait decoding and formatting |
-| [`js/display/colormaps.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/display/colormaps.ts) | colormaps and image rendering |
+| [`js/display/colormaps.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/display/colormaps.ts) | colormaps and image rendering; import from it, while the code lives in `luts.ts`, `displayMath.ts` (CPU path), `colormapEngine.ts` (WebGPU engine), `gpuRange.ts`, `directRender.ts`, `displayShaders.ts` and `volumeSlice.ts` |
 | [`js/display/stats.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/display/stats.ts) | display ranges and image statistics |
 | [`js/figure.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/figure.ts) | scale bars and figure formatting |
 | [`js/staticFallback.ts`](https://github.com/electronmicroscopy/quantem.widget/blob/main/js/staticFallback.ts) | saved-notebook fallback behavior |

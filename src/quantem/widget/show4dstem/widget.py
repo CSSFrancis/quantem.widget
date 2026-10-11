@@ -5,7 +5,8 @@ One class opens every input the tutorials use: a file path (read with
 in bounded windows), a quantem core ``Dataset4dstem``, a list of either (one
 virtual image per dataset under a shared detector) or ``from_folder``, a NumPy
 array or a Torch tensor (dense, on the tensor's device), or a folder of linked
-HDF5 masters read by the browser itself (``h5_urls``, the CLI WebGPU export).
+HDF5 masters or .qem acquisitions read by the browser itself (``h5_urls`` or
+``qem_urls``, the WebGPU folder exports).
 
 quantem.gpu and quantem core are reached only through
 ``quantem.widget.adapters``. A file becomes a ``Dataset4dstemGPU`` when
@@ -40,7 +41,7 @@ from quantem.widget.adapters.gpu import AcquisitionSeries, AcquisitionView
 from quantem.widget.counts import counts_tensor, detector_bin_mean, host_dtype_for_torch, tensor_dtype
 from quantem.widget.device import gpu_notice, gpu_path_hint, no_gpu_path, print_once, resolve_device
 from quantem.widget.folder_watch_status import FOLDER_WATCH_STATE_VALUES, set_folder_watch_status
-from quantem.widget.export import HtmlExportMixin
+from quantem.widget.export import HtmlExportMixin, export_slug
 from quantem.widget.fallback import StaticFallbackMixin
 from quantem.widget.show4dstem import export as html_export
 from quantem.widget.show4dstem import reader
@@ -50,7 +51,7 @@ from quantem.widget.show4dstem.detector import PRESET_RADII, fit_disk, preset_ma
 from quantem.widget.show4dstem.preview import static_png_b64
 from quantem.widget.state import SavedStateMixin
 from quantem.widget.utils.state_io import unwrap_state_payload
-from quantem.widget.utils.ui import UiMode, resolve_ui_mode
+from quantem.widget.utils.ui import UiMode, reject_unknown_kwargs, resolve_ui_mode
 
 DEFAULT_BF_RATIO = 0.125  # bright-field radius as a fraction of the detector side before fitting
 MIN_LOG_VALUE = 1e-10  # keeps log scaling finite on an all-zero pattern
@@ -154,8 +155,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         Compute the four preset images up front so preset clicks are instant.
     ssb_voltage_kV, ssb_semiangle_mrad, ssb_scan_sampling_A, ssb_det_sampling_mrad
         Physical calibration for ``compute_ssb`` when the dataset lacks it.
-    view_mode, compare_cols, compare_grid_width_px, compare_max_panels,
-    compare_group_mode, compare_dp_mode
+    view_mode, compare_cols, compare_grid_width_px, compare_max_panels, compare_group_mode, compare_dp_mode
         Comparison grid layout for several datasets: ``"multiple"`` shows one
         virtual image per dataset, ``compare_max_panels`` per page, with the
         diffraction pattern of the ``"selected"`` dataset or the ``"average"``.
@@ -163,8 +163,9 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         Pack the counts for the browser so the widget works without a kernel
         (``None`` packs automatically under a 2 GB budget). A GPU acquisition
         is read into the pack in small scan windows.
-    h5_urls, scan_shape, detector_shape, backend
-        Browser WebGPU source over linked HDF5 masters, written by the CLI.
+    h5_urls, qem_urls, scan_shape, detector_shape, backend
+        Browser WebGPU source over linked HDF5 masters or .qem acquisitions,
+        written by the CLI and ``show4dstem.export.write_qem_bundle``.
     """
 
     _esm = pathlib.Path(__file__).parent.parent / "static" / "show4dstem.js"
@@ -202,6 +203,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
     offline = traitlets.Bool(False).tag(sync=True)
     _offline_stack = traitlets.Bytes(b"").tag(sync=True)
     _h5_urls = traitlets.Unicode("").tag(sync=True)
+    _qem_urls = traitlets.Unicode("").tag(sync=True)
     _offline_bad_px = traitlets.Unicode("").tag(sync=True)
     ssb_compute_request = traitlets.Unicode("").tag(sync=True)
     ssb_compute_status = traitlets.Unicode("").tag(sync=True)
@@ -330,6 +332,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         offline: bool | None = False,
         offline_dtype: str = "uint8",
         h5_urls: Sequence[str] | None = None,
+        qem_urls: Sequence[str] | None = None,
         backend: str | None = None,
         show_fft: bool = False,
         panel_width_px: int = 0,
@@ -342,22 +345,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         **kwargs,
     ):
         """Validate the arguments, place the data on its compute device and set the traits (see the class docstring)."""
-        # save_state=False keeps the packed 4D stack out of the notebook's saved
-        # widget metadata; a static preview stands in for a cold reopen.
-        self._save_state = bool(save_state)
-        self._configure_static_fallback(
-            notebook_preview_format=notebook_preview_format,
-            notebook_preview_quality=notebook_preview_quality,
-            notebook_preview_max_px=notebook_preview_max_px,
-        )
-        ui = resolve_ui_mode(
-            ui_mode,
-            defaults={"show_title": True, "show_controls": True, "controls_collapsed": False,
-                      "show_stats": True, "show_scale_bar": True},
-            overrides={"show_title": show_title, "show_controls": show_controls,
-                       "controls_collapsed": controls_collapsed, "show_stats": show_stats,
-                       "show_scale_bar": show_scale_bar},
-        )
+        # close() runs even when a check below refuses the call (ipywidgets closes in __del__), so its state exists first
         self._data = None  # get_state runs inside open(); the data joins once the model exists
         self._verbose = bool(verbose)
         self._sessions: dict[int, object] = {}  # DenseSession or a quantem.gpu detector session per dataset
@@ -376,6 +364,23 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         self._folder_watch_started = False
         self._folder_poll_lock = threading.Lock()
         self._compare_lock = threading.RLock()
+        reject_unknown_kwargs(type(self), kwargs)
+        # save_state=False keeps the packed 4D stack out of the notebook's saved
+        # widget metadata; a static preview stands in for a cold reopen.
+        self._save_state = bool(save_state)
+        self._configure_static_fallback(
+            notebook_preview_format=notebook_preview_format,
+            notebook_preview_quality=notebook_preview_quality,
+            notebook_preview_max_px=notebook_preview_max_px,
+        )
+        ui = resolve_ui_mode(
+            ui_mode,
+            defaults={"show_title": True, "show_controls": True, "controls_collapsed": False,
+                      "show_stats": True, "show_scale_bar": True},
+            overrides={"show_title": show_title, "show_controls": show_controls,
+                       "controls_collapsed": controls_collapsed, "show_stats": show_stats,
+                       "show_scale_bar": show_scale_bar},
+        )
         # Every check and the file read run before super().__init__ opens the widget model, so a
         # refused input (a bad argument, a file above the memory ceiling) leaves no model behind.
         if backend not in (None, "webgpu"):
@@ -395,8 +400,11 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
                 raise ValueError(f"{name} must be >= 0, got {value}")
         if int(compare_max_panels) < 1:
             raise ValueError(f"compare_max_panels must be >= 1, got {compare_max_panels}")
-        if h5_urls and (scan_shape is None or detector_shape is None):
-            raise ValueError("Show4DSTEM(..., h5_urls=...) requires scan_shape=(rows, cols) and detector_shape=(rows, cols).")
+        if h5_urls and qem_urls:
+            raise ValueError("Pass h5_urls= or qem_urls=, not both: one viewer reads one kind of browser source.")
+        browser_urls = h5_urls or qem_urls
+        if browser_urls and (scan_shape is None or detector_shape is None):
+            raise ValueError("Show4DSTEM(..., h5_urls= or qem_urls=...) requires scan_shape=(rows, cols) and detector_shape=(rows, cols).")
 
         # Route the input to its storage: bounded views over GPU acquisitions,
         # a dense tensor on its device, or no data at all for a browser source.
@@ -413,8 +421,8 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         series = listed and any(gpu_adapter.is_acquisition(item) for item in data)
         bounded = gpu_adapter.is_acquisition(data) or series
         datasets = listed and all(core_adapter.is_dataset(item, ndim=4) for item in data)
-        if bounded and h5_urls:
-            raise ValueError("h5_urls= opens files in the browser; pass the acquisition without it, or the URLs alone.")
+        if bounded and browser_urls:
+            raise ValueError("h5_urls= and qem_urls= open files in the browser; pass the acquisition without them, or the URLs alone.")
         if bounded or datasets or core_adapter.is_dataset(data, ndim=4):
             # A dataset (or a list of them) carries its name and calibration.
             first = data[0] if listed else data
@@ -458,8 +466,8 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         view_mode = self._normalise_view_mode("single" if view_mode is None else view_mode)
         compare_dp_mode = self._normalise_compare_dp_mode("average" if compare_dp_mode is None else compare_dp_mode)
         compare_group_mode = self._normalise_compare_group_mode(compare_group_mode)
-        if h5_urls:
-            urls = list(dict.fromkeys(str(url) for url in h5_urls))
+        if browser_urls:
+            urls = list(dict.fromkeys(str(url) for url in browser_urls))
             data = None
             data_device = torch.device("cpu")
             shape = (len(urls), *scan_shape, *detector_shape) if len(urls) > 1 else (*scan_shape, *detector_shape)
@@ -556,8 +564,11 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         self.center_col = float(self.det_cols / 2) if center is None else float(center[1])
         self.bf_radius = min(self.det_rows, self.det_cols) * DEFAULT_BF_RATIO if bf_radius is None else float(bf_radius)
 
-        if h5_urls:
-            self._h5_urls = json.dumps(urls)
+        if browser_urls:
+            if h5_urls:
+                self._h5_urls = json.dumps(urls)
+            else:
+                self._qem_urls = json.dumps(urls)
             self.offline = True
             self.ssb_compute_enabled = False
             self.dp_global_min = MIN_LOG_VALUE
@@ -810,7 +821,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
         in ``dataset_scope`` (``unhidden``, ``current_page``, ``starred`` or
         ``all``) with no raw 4D payload.
         """
-        if self._data is None and not self._h5_urls:
+        if self._data is None and not (self._h5_urls or self._qem_urls):
             raise ValueError("Cannot export HTML after free(); rebuild the widget first.")
         dtype, det_bin, scan_bin = html_export.export_options(self, dtype, det_bin, scan_bin)
         kind = html_export.export_kind(export_kind)
@@ -908,6 +919,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
             self.roi_center_row = float(self.center_row)
             self.roi_center_col = float(self.center_col)
             if preset == "bf":
+                self.roi_radius_inner = 0.0
                 self.roi_radius = float(max(1.0, bf_radius))
             elif preset == "abf":
                 self.roi_radius_inner = float(max(0.5, bf_radius * 0.5))
@@ -1670,7 +1682,7 @@ class Show4DSTEM(SavedStateMixin, HtmlExportMixin, StaticFallbackMixin, anywidge
                     "elapsed_s": None if result.elapsed is None else float(result.elapsed)},
         }, indent=2)
         self.ssb_compute_calibration_filename = (
-            f"{html_export.slug(self.title)}_{self.shape_rows}x{self.shape_cols}x{self.det_rows}x{self.det_cols}_ssb_calibration.json"
+            f"{export_slug(self.title, 'show4dstem')}_{self.shape_rows}x{self.shape_cols}x{self.det_rows}x{self.det_cols}_ssb_calibration.json"
         )
         com_row, com_col = gpu_adapter.center_of_mass(source, scan_shape=(self.shape_rows, self.shape_cols))
         theta = math.radians(physical_rotation)

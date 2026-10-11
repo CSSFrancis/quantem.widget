@@ -26,7 +26,7 @@ from PIL import Image
 
 from quantem.widget.adapters import core as core_adapter
 from quantem.widget.folder_watch_status import FOLDER_WATCH_STATE_VALUES
-from quantem.widget.colormap import Colormap, cmap_to_name, is_cmap_sequence
+from quantem.widget.colormap import Colormap, auto_window, cmap_to_name, contrast_uint8, display_window, is_cmap_sequence, signed_log1p
 from quantem.widget.export import HtmlExportMixin
 from quantem.widget.fallback import StaticFallbackMixin
 from quantem.widget.pages import PagesMixin
@@ -52,7 +52,7 @@ from quantem.widget.show2d.fallback import Show2DStaticPng
 from quantem.widget.show2d.state import Show2DState
 from quantem.widget.utils.array import _b64_safe, _resize_image, bin2d, to_numpy
 from quantem.widget.utils.state_io import unwrap_state_payload
-from quantem.widget.utils.ui import UiMode, resolve_ui_mode
+from quantem.widget.utils.ui import UiMode, reject_unknown_kwargs, resolve_ui_mode
 
 _DEFAULT_FOLDER_PAGE_SIZE = 20
 _MAX_PANEL_PLAYBACK_FPS = 30.0
@@ -73,24 +73,6 @@ def _nonnegative_int(value: object, *, name: str) -> int:
     if result < 0:
         raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
     return result
-
-
-def _reject_unknown_kwargs(cls, kwargs: dict) -> None:
-    """Raise TypeError if kwargs contains any key that isn't a declared trait.
-
-    anywidget/traitlets silently accept unknown keys, which let stale notebooks
-    pass obsolete params like ``pixel_size_angstrom=0.5`` with no warning.  This
-    helper catches typos and renamed-trait references at construction time.
-    """
-    traits = set(cls.class_trait_names())
-    unknown = [key for key in kwargs if key not in traits]
-    if unknown:
-        first = sorted(unknown)[0]
-        raise TypeError(
-            f"{cls.__name__}() got unexpected keyword argument {first!r}. "
-            f"Check for typos or a renamed parameter (e.g. canvas_size → size, "
-            f"image_width_px → size, pixel_size_angstrom → pixel_size)."
-        )
 
 
 _BROWSER_DENOISE_MODES = ("none", "gaussian", "anscombe")
@@ -480,9 +462,12 @@ class Show2D(
     inset_plots, panel_annotations, overlays, panel_overlays : optional
         Per-panel inset curves, text annotations and shape overlays; see
         ``show2d.annotations`` for the dict schema.
-    inter_panel_gap_px, inter_panel_gap_color, gallery_outer_border_px,
-    gallery_outer_border_color, panel_inner_border_px, panel_inner_border_color : optional
-        Gallery chrome.
+    inter_panel_gap_px, inter_panel_gap_color : optional
+        Gallery chrome: the gap between panels.
+    gallery_outer_border_px, gallery_outer_border_color : optional
+        Gallery chrome: the frame around the whole gallery.
+    panel_inner_border_px, panel_inner_border_color : optional
+        Gallery chrome: each panel's own inner stroke.
     gallery_gap_px : int, optional
         Older name of ``inter_panel_gap_px``; pass one of the two.
     denoise : {"none", "gaussian", "anscombe"} or list of str, default "none"
@@ -865,10 +850,7 @@ class Show2D(
         verbose: bool = True,
         **kwargs,
     ):
-        # Reject typos and stale kwargs (e.g. image_width_px, pixel_size_angstrom).
-        # anywidget/traitlets silently ignores unknown keys, which hid the
-        # pixel_size_angstrom bug in show2d_all_features.ipynb for months.
-        _reject_unknown_kwargs(type(self), kwargs)
+        reject_unknown_kwargs(type(self), kwargs)
         requested_panel_cmaps = (
             [cmap_to_name(item) for item in cmap]
             if is_cmap_sequence(cmap)
@@ -1896,20 +1878,15 @@ class Show2D(
         else:
             # Same contrast window as the browser: explicit vmin/vmax, else the
             # 2/98 percentiles under auto_contrast, else the frame extrema.
-            display_frame = np.log1p(np.maximum(frame, 0)) if self.log_scale else frame
+            display_frame = signed_log1p(frame) if self.log_scale else frame
             if self.vmin is not None and self.vmax is not None:
-                display_min, display_max = float(self.vmin), float(self.vmax)
-                if self.log_scale:
-                    display_min, display_max = float(np.log1p(max(display_min, 0))), float(np.log1p(max(display_max, 0)))
+                display_min, display_max = display_window(self.vmin, self.vmax, self.log_scale)
             elif self.auto_contrast:
-                display_min, display_max = (float(value) for value in np.percentile(display_frame, (2, 98)))
+                display_min, display_max = auto_window(frame, self.log_scale)
             else:
-                display_min, display_max = float(display_frame.min()), float(display_frame.max())
+                display_min, display_max = display_window(frame.min(), frame.max(), self.log_scale)
             # 8-bit levels: the colormap lookup and the PNG are both 256-level.
-            if display_max > display_min:
-                levels = np.clip((display_frame - display_min) / (display_max - display_min) * 255, 0, 255).astype(np.uint8)
-            else:
-                levels = np.zeros(frame.shape, dtype=np.uint8)
+            levels = contrast_uint8(display_frame, display_min, display_max)
             display_pixels = None
 
         use_figure = title or colorbar or scalebar
@@ -1940,12 +1917,15 @@ class Show2D(
                 ax.set_title(label, fontsize=14, fontweight="bold", pad=8)
 
         if colorbar:
-            # The image holds 0-255 levels; ticks read back in data values.
+            # The image holds 0-255 levels; ticks read back in display values, which under
+            # log scale are signed log1p values marked "log", as the browser's colorbar shows them.
             colorbar_artist = fig.colorbar(image_artist, ax=ax, fraction=0.046, pad=0.04)
             tick_positions = np.linspace(0, 255, 5)
             tick_labels = [f"{display_min + (display_max - display_min) * tick / 255:.4g}" for tick in tick_positions]
             colorbar_artist.set_ticks(tick_positions)
             colorbar_artist.set_ticklabels(tick_labels)
+            if self.log_scale:
+                colorbar_artist.set_label("log")
 
         if scalebar and self.pixel_size > 0:
             # A nice physical length near 20% of the image width.

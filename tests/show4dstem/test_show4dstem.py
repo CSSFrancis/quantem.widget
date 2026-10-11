@@ -9,6 +9,7 @@ where the two paths must agree exactly.
 
 import gzip
 import json
+import re
 from pathlib import Path
 
 import comm
@@ -267,6 +268,17 @@ def test_scan_position_outside_the_scan_stops_at_its_edge():
         widget.close()
 
 
+def test_a_removed_keyword_raises_and_a_trait_keyword_still_sets():
+    # traitlets only warns about a keyword it does not know, so a removed one did nothing
+    with pytest.raises(TypeError, match="unexpected keyword argument 'compare_panel_gap_px'"):
+        Show4DSTEM(_counts(1), compare_panel_gap_px=0)
+    widget = Show4DSTEM(_counts(1), precompute_virtual_images=False, dp_scale_mode="linear")
+    try:
+        assert widget.dp_scale_mode == "linear"
+    finally:
+        widget.close()
+
+
 def test_mask_goldens_shared_with_the_browser_are_the_python_masks():
     # js/show4dstem/detectorInteraction.test.ts checks the drawn detector overlay against these pixels
     goldens = json.loads((Path(__file__).resolve().parents[2] / "js" / "show4dstem" / "maskGoldens.json").read_text())
@@ -343,6 +355,51 @@ def test_state_round_trips_through_dict_and_file(tmp_path):
             np.testing.assert_array_equal(_pattern(restored), counts[1, 2])
         finally:
             restored.close()
+
+
+def test_annular_after_bf_is_the_bright_disk_not_a_zero_area_ring():
+    """ADF then BF then Annular: the BF disk must not keep ADF's inner radius."""
+    counts = _counts(4)
+    widget = Show4DSTEM(counts, precompute_virtual_images=False)
+    try:
+        widget.apply_preset("adf").apply_preset("bf")
+        assert widget.roi_radius_inner == 0.0
+        widget.roi_mode = "annular"
+        bright = widget.virtual_image()
+        assert bright.min() > 0
+        widget.roi_mode = "circle"
+        np.testing.assert_array_equal(widget.virtual_image(), bright)
+    finally:
+        widget.close()
+
+
+def test_refused_argument_raises_without_a_cleanup_traceback():
+    """ipywidgets closes the half-built widget in __del__; that close must not fail on missing state."""
+    import gc
+    import sys
+
+    unraisable = []
+    previous = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        with pytest.raises(TypeError):
+            Show4DSTEM(_counts(5), detector_radius=3)
+        gc.collect()
+    finally:
+        sys.unraisablehook = previous
+    assert [str(hook.exc_value) for hook in unraisable] == []
+
+
+def test_widget_calls_only_functions_its_export_module_defines():
+    """compute_ssb replaces _ssb_phase in the tests below, so a stale export name there never ran in CI."""
+    import inspect
+    import re
+
+    from quantem.widget.show4dstem import export as html_export
+    from quantem.widget.show4dstem import widget as widget_module
+
+    called = set(re.findall(r"\bhtml_export\.(\w+)", inspect.getsource(widget_module)))
+    assert called and called <= set(dir(html_export)), sorted(called - set(dir(html_export)))
 
 
 def test_product_map_from_compute_ssb_becomes_the_image(monkeypatch):
@@ -609,4 +666,33 @@ def test_webgpu_bundle_links_masters_and_writes_vendored_viewer(tmp_path):
     assert '__QT_H5_DECODE_DTYPE ??= "uint8"' in page
     assert "__QT_REQUIRE_LOCAL_H5_FILES = true" in page
     assert "cdn.jsdelivr.net" not in page and (tmp_path / ".viewer" / "anywidget.min.js").exists()
+    # opened from disk the page has origin null: a crossorigin or integrity attribute blocks the local script
+    local_scripts = re.findall(r"<script\b[^>]*\bsrc=\"\./[^\"]*\"[^>]*>", page)
+    assert len(local_scripts) >= 2 and not [tag for tag in local_scripts if "crossorigin" in tag or "integrity" in tag]
     assert ".viewer/Show4DSTEM.html" in (tmp_path / "index.html").read_text()
+
+
+def test_qem_bundle_links_acquisitions_for_a_streaming_viewer(tmp_path):
+    """A .qem folder viewer: relative links beside the page, the files named in its state, no HDF5 tuning."""
+    reference = pytest.importorskip("quantem.gpu.formats.qem.reference")
+    from quantem.widget.show4dstem.export import write_qem_bundle
+
+    data = tmp_path / "data"
+    data.mkdir()
+    for name, seed in (("tilt_a.qem", 1), ("tilt_b.qem", 2)):
+        reference.save_array(data / name, _counts(seed, scan=(3, 4)))
+    launcher = write_qem_bundle([data / "tilt_a.qem", data / "tilt_b.qem"], tmp_path / "viewer",
+                                frame_labels=["-17 mrad", "+17 mrad"], port=8898)
+    viewer = tmp_path / "viewer"
+    assert launcher == viewer / "Show4DSTEM.command" and "8898" in launcher.read_text()
+    for name in ("tilt_a.qem", "tilt_b.qem"):
+        link = viewer / "qem" / name
+        assert link.is_symlink() and not Path(link.readlink()).is_absolute()
+        assert link.read_bytes() == (data / name).read_bytes()
+    page = (viewer / ".viewer" / "Show4DSTEM.html").read_text()
+    assert '\\"../qem/tilt_a.qem\\", \\"../qem/tilt_b.qem\\"' in page
+    assert "+17 mrad" in page and "__QT_H5_DECODE_DTYPE ??=" not in page
+    assert '\"compare_cols\": 2' in page
+    reference.save_array(data / "wide.qem", _counts(3, scan=(3, 5)))
+    with pytest.raises(ValueError, match="one viewer compares acquisitions of one shape"):
+        write_qem_bundle([data / "tilt_a.qem", data / "wide.qem"], tmp_path / "other")
