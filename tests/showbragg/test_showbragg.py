@@ -136,7 +136,7 @@ def test_detect_and_fit_populate_results(fitted: ShowBragg) -> None:
     assert fitted.detection_state == "done"
     assert fitted.fit_state == "done"
     assert fitted.peaks.shape == (6, 5)
-    assert fitted.bragg.u_array.shape == (6, 5, 2)
+    assert fitted.bragg.g1_array.shape == (6, 5, 2)
     assert len(fitted.mask_weight_png) > 0
     assert len(fitted.fit_error_png) > 0
 

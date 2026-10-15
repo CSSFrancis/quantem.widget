@@ -7,6 +7,7 @@ from typing import Any
 
 import anywidget
 import numpy as np
+import torch
 import traitlets
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
@@ -14,6 +15,15 @@ from quantem.core.datastructures.vector import Vector
 from quantem.diffraction.bragg_vectors import BraggVectors
 from quantem.diffraction.disk_detection import SUBPIXEL_MODES
 from quantem.diffraction.strain import StrainMap
+
+try:
+    from quantem.diffraction.neural_disk_detection import load_spot_unet, neural_heatmap
+    from quantem.diffraction.spot_detection import (
+        detect_beamstop,
+        difference_of_gaussians_snr,
+    )
+except ImportError:  # a quantem without the template-free detectors
+    load_spot_unet = neural_heatmap = detect_beamstop = difference_of_gaussians_snr = None
 
 from quantem.widget.render import frame_to_rgb, rgb_to_png_bytes
 from quantem.widget.utils.array import to_numpy
@@ -23,6 +33,15 @@ from quantem.widget.utils.ui import UiMode, resolve_ui_mode
 
 TEMPLATE_SOURCES = ("synthetic", "data", "probe")
 STAGE_STATES = ("idle", "preview", "running", "done", "error")
+DETECTION_METHODS = ("correlation", "dog", "neural")
+# Switching method resets the controls whose meaning changes with it: the
+# Difference-of-Gaussians threshold is a signal-to-noise ratio, the neural one a
+# heatmap confidence, and correlation thresholds on min_abs_intensity instead.
+METHOD_DEFAULTS = {
+    "correlation": {"min_spacing": 0.0, "subpixel": "upsample"},
+    "dog": {"threshold": 10.0, "min_spacing": 5.0, "subpixel": "parabolic"},
+    "neural": {"threshold": 0.3, "min_spacing": 4.0},
+}
 
 
 class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
@@ -35,6 +54,9 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         detection kept.
     probe : array_like, optional
         Measured vacuum probe, required for template_source="probe".
+    model_path : str or Path, optional
+        Local SpotUNet checkpoint for detection_method="neural", instead of the
+        em-database download.
     device : str, default="cpu"
         Torch device passed through to BraggVectors.
     cmap : str, default="inferno"
@@ -106,6 +128,14 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     probe_correlation_png = traitlets.Bytes(b"").tag(sync=True)
 
     # Stages 3 and 4, detection
+    detection_method = traitlets.Enum(DETECTION_METHODS, default_value="correlation").tag(
+        sync=True
+    )
+    threshold = traitlets.Float(0.3).tag(sync=True)
+    dog_sigma1 = traitlets.Float(0.8).tag(sync=True)
+    dog_sigma2 = traitlets.Float(2.0).tag(sync=True)
+    spot_radius = traitlets.Float(0.0).tag(sync=True)
+    mask_beamstop = traitlets.Bool(False).tag(sync=True)
     min_abs_intensity = traitlets.Float(0.0).tag(sync=True)
     min_spacing = traitlets.Float(0.0).tag(sync=True)
     edge_boundary = traitlets.Int(1).tag(sync=True)
@@ -145,6 +175,12 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         "template_subtract_mean",
         "template_roi",
     )
+    _RESPONSE_TRAITS = (
+        "dog_sigma1",
+        "dog_sigma2",
+        "spot_radius",
+        "mask_beamstop",
+    )
     _CANDIDATE_TRAITS = (
         "num_candidates",
         "candidate_min_spacing",
@@ -162,6 +198,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         data,
         *,
         probe=None,
+        model_path=None,
         device: str = "cpu",
         cmap: str = "inferno",
         log_scale: bool = False,
@@ -191,6 +228,8 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
 
         dataset = self._bragg.dataset
         self._probe = None if probe is None else to_numpy(probe, dtype=np.float32)
+        self._model_path = model_path
+        self._spot_unet = None
 
         if self._bragg.template is None:
             self._build_template()
@@ -232,12 +271,14 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
                 self.detection_state = "done"
                 self._update_bvm()
                 self._choose_basis()
-            if self._bragg.u_array is not None:
+            if self._bragg.g1_array is not None:
                 self.fit_state = "done"
                 self._render_fit()
 
         self.observe(self._on_template_change, names=self._TEMPLATE_TRAITS)
         self.observe(self._on_probe_change, names="probe_position")
+        self.observe(self._on_method_change, names="detection_method")
+        self.observe(self._on_probe_change, names=self._RESPONSE_TRAITS)
         self.observe(self._on_basis_change, names=self._CANDIDATE_TRAITS)
         self.observe(self._on_display_change, names=["cmap", "log_scale"])
         self.on_msg(self._handle_msg)
@@ -319,15 +360,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         Vector
             Detected peaks.
         """
-        detect_kwargs = {
-            "min_abs_intensity": float(self.min_abs_intensity),
-            "min_spacing": float(self.min_spacing),
-            "edge_boundary": int(self.edge_boundary),
-            "subpixel": str(self.subpixel),
-            "upsample_factor": int(self.upsample_factor),
-            "max_num_peaks": int(self.max_num_peaks),
-            **kwargs,
-        }
+        detect_kwargs = {**self._method_kwargs(), **kwargs}
         preview = positions is not None
 
         self.detection_state = "preview" if preview else "running"
@@ -345,8 +378,8 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             self.preview_peaks = json.dumps(
                 {
                     "positions": [[int(r), int(c)] for r, c in positions],
-                    "counts": [int(found[i].array.shape[0]) for i in range(len(positions))],
-                    "peaks": [[float(v) for v in row] for row in found[0].array],
+                    "counts": [int(found[i].numpy().shape[0]) for i in range(len(positions))],
+                    "peaks": [[float(v) for v in row] for row in found[0].numpy()],
                 }
             )
             self.detection_state = "done" if self._bragg.peaks is not None else "idle"
@@ -422,6 +455,80 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         return self._bragg.calculate_strain_map(**kwargs)
 
     # Stage handlers
+
+    def _method_kwargs(self) -> dict[str, Any]:
+        """detect_disks keyword arguments for the selected detection method."""
+        method = str(self.detection_method)
+        common = {
+            "method": method,
+            "min_spacing": float(self.min_spacing),
+            "max_num_peaks": int(self.max_num_peaks),
+        }
+        if method == "correlation":
+            return {
+                **common,
+                "min_abs_intensity": float(self.min_abs_intensity),
+                "edge_boundary": int(self.edge_boundary),
+                "subpixel": str(self.subpixel),
+                "upsample_factor": int(self.upsample_factor),
+            }
+        mask = "auto" if self.mask_beamstop else None
+        if method == "dog":
+            return {
+                **common,
+                "threshold": float(self.threshold),
+                "sigma1": float(self.dog_sigma1),
+                "sigma2": float(self.dog_sigma2),
+                "edge_boundary": int(self.edge_boundary),
+                "subpixel": str(self.subpixel),
+                "mask": mask,
+            }
+        return {
+            **common,
+            "threshold": float(self.threshold),
+            "spot_diameter": 2.0 * float(self.spot_radius) or None,
+            "mask": mask,
+            "model_path": self._model_path,
+        }
+
+    def _neural_model(self):
+        """The SpotUNet for detection_method="neural", loaded on first use."""
+        if self._spot_unet is None:
+            self._spot_unet = load_spot_unet(self._model_path, device=self._bragg.device)
+        return self._spot_unet
+
+    def _response_map(self, row: int, col: int) -> np.ndarray:
+        """What the selected method thresholds, for the pattern at one scan position."""
+        method = str(self.detection_method)
+        if method == "correlation":
+            return self._bragg.correlation_map(row, col)
+        if difference_of_gaussians_snr is None:
+            raise ImportError(
+                f"detection_method={method!r} needs a quantem with "
+                "quantem.diffraction.spot_detection."
+            )
+        pattern = torch.as_tensor(
+            np.asarray(self._bragg.dataset.array[row, col]),
+            dtype=torch.float32,
+            device=self._bragg.device,
+        )[None]
+        if method == "dog":
+            mask = self._beamstop()
+            mask_t = None if mask is None else torch.as_tensor(mask, device=pattern.device)
+            snr = difference_of_gaussians_snr(
+                pattern, float(self.dog_sigma1), float(self.dog_sigma2), mask_t
+            )
+            return snr[0].clamp_min(0).cpu().numpy()
+        heatmap = neural_heatmap(
+            pattern, self._neural_model(), spot_diameter=2.0 * float(self.spot_radius) or None
+        )
+        return heatmap[0].cpu().numpy()
+
+    def _beamstop(self) -> np.ndarray | None:
+        """Beam-stop mask from the mean pattern when mask_beamstop is on."""
+        if not self.mask_beamstop:
+            return None
+        return detect_beamstop(np.asarray(self._bragg.dataset.dp_mean.array))
 
     def _build_template(self) -> None:
         """Rebuild the correlation template from the current template traits."""
@@ -574,7 +681,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         pattern = np.asarray(self._bragg.dataset.array[row, col])
         with self.hold_sync():
             self.probe_diffraction_png = self._render(pattern)
-            self.probe_correlation_png = self._render(self._bragg.correlation_map(row, col))
+            self.probe_correlation_png = self._render(self._response_map(row, col))
 
     def _update_bvm(self) -> None:
         bvm = self._bragg.compute_bvm(float(self.bvm_sampling))
@@ -599,7 +706,19 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             self._render_probe()
 
     def _on_probe_change(self, _change) -> None:
-        self._render_probe()
+        try:
+            self._render_probe()
+        except Exception as exc:
+            self.status = str(exc)
+            return
+        self.status = ""
+
+    def _on_method_change(self, change) -> None:
+        with self.hold_sync():
+            for name, value in METHOD_DEFAULTS[change["new"]].items():
+                setattr(self, name, value)
+            self.preview_peaks = ""
+            self._on_probe_change(change)
 
     def _on_basis_change(self, _change) -> None:
         if getattr(self, "_resolving_basis", False):
@@ -612,7 +731,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             self._render_probe()
             if self._bragg.bvm is not None:
                 self.bvm_png = self._render(self._bragg.bvm.array)
-            if self._bragg.u_array is not None:
+            if self._bragg.g1_array is not None:
                 self._render_fit()
 
     def _handle_msg(self, _widget: Any, content: dict[str, Any], _buffers: list[Any]) -> None:

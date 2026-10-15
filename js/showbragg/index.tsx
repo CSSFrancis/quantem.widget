@@ -34,6 +34,16 @@ const LABEL_CLEARANCE_PX = 26;
 const BASIS_LABELS = ["origin", "g1", "g2"] as const;
 const SPACING = { XS: 4, SM: 8, MD: 12, LG: 16 } as const;
 const CMAPS = ["inferno", "magma", "viridis", "plasma", "gray", "turbo"];
+const METHODS = [
+  { value: "correlation", label: "template correlation" },
+  { value: "dog", label: "difference of Gaussians" },
+  { value: "neural", label: "neural (SpotUNet)" },
+] as const;
+const RESPONSE_CAPTIONS: Record<string, string> = {
+  correlation: "correlation map",
+  dog: "band-pass signal-to-noise",
+  neural: "network confidence",
+};
 
 const compactButton = {
   fontSize: 10,
@@ -378,6 +388,12 @@ function ShowBragg() {
   const [probeDiffractionPng] = useModelState<DataView>("probe_diffraction_png");
   const [probeCorrelationPng] = useModelState<DataView>("probe_correlation_png");
 
+  const [detectionMethod, setDetectionMethod] = useModelState<string>("detection_method");
+  const [threshold, setThreshold] = useModelState<number>("threshold");
+  const [dogSigma1, setDogSigma1] = useModelState<number>("dog_sigma1");
+  const [dogSigma2, setDogSigma2] = useModelState<number>("dog_sigma2");
+  const [spotRadius, setSpotRadius] = useModelState<number>("spot_radius");
+  const [maskBeamstop, setMaskBeamstop] = useModelState<boolean>("mask_beamstop");
   const [minAbsIntensity, setMinAbsIntensity] = useModelState<number>("min_abs_intensity");
   const [minSpacing, setMinSpacing] = useModelState<number>("min_spacing");
   const [edgeBoundary, setEdgeBoundary] = useModelState<number>("edge_boundary");
@@ -416,6 +432,7 @@ function ShowBragg() {
   const fitting = fitState === "running";
   const busy = detecting || fitting;
   const hasPeaks = candidates.length > 0 || bvmPng?.byteLength > 0;
+  const usesTemplate = detectionMethod === "correlation";
 
   const preview: PreviewPeaks | null = React.useMemo(() => {
     if (!previewPeaksJson) return null;
@@ -611,7 +628,11 @@ function ShowBragg() {
         </Stack>
       )}
 
-      <Panel title="1. Template" colors={colors}>
+      <Panel
+        title="1. Template"
+        colors={colors}
+        blocked={usesTemplate ? undefined : "This detection method needs no template."}
+      >
         <Stack direction="row" spacing={2} alignItems="flex-start" flexWrap="wrap">
           {controlsVisible && (
           <Stack spacing={1.5} sx={{ minWidth: 200 }}>
@@ -699,30 +720,80 @@ function ShowBragg() {
             shape={qShape}
             colors={colors}
             overlay={drawPreviewPeaks}
-            caption="correlation map"
+            caption={RESPONSE_CAPTIONS[detectionMethod] ?? "response"}
           />
         </Stack>
       </Panel>
 
       <Panel title="3. Detection" colors={colors}>
         {controlsVisible && (
-        <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap>
-          <NumberField label="min_abs_intensity" value={minAbsIntensity} step={0.1} onChange={setMinAbsIntensity} colors={colors} />
-          <NumberField label="min_spacing" value={minSpacing} step={0.5} onChange={setMinSpacing} colors={colors} />
-          <NumberField label="edge_boundary" value={edgeBoundary} onChange={setEdgeBoundary} colors={colors} />
-          <NumberField label="upsample_factor" value={upsampleFactor} onChange={setUpsampleFactor} colors={colors} />
-          <NumberField label="max_num_peaks" value={maxNumPeaks} onChange={setMaxNumPeaks} colors={colors} />
-          <NumberField label="preview_grid" hint="preview samples an N x N grid" value={previewGrid} onChange={setPreviewGrid} colors={colors} />
+        <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap alignItems="center">
           <Select
             size="small"
-            value={subpixel}
-            onChange={(e) => setSubpixel(e.target.value)}
-            sx={{ width: 120, fontSize: 11, "& .MuiSelect-select": { py: 0.5, color: colors.text } }}
+            value={detectionMethod}
+            onChange={(e) => setDetectionMethod(e.target.value)}
+            aria-label="detection method"
+            sx={{ width: 200, fontSize: 11, "& .MuiSelect-select": { py: 0.5, color: colors.text } }}
           >
-            <MenuItem sx={{ fontSize: 11 }} value="none">none</MenuItem>
-            <MenuItem sx={{ fontSize: 11 }} value="parabolic">parabolic</MenuItem>
-            <MenuItem sx={{ fontSize: 11 }} value="upsample">upsample</MenuItem>
+            {METHODS.map(({ value, label }) => (
+              <MenuItem key={value} sx={{ fontSize: 11 }} value={value}>{label}</MenuItem>
+            ))}
           </Select>
+          {usesTemplate ? (
+            <NumberField label="min_abs_intensity" value={minAbsIntensity} step={0.1} onChange={setMinAbsIntensity} colors={colors} />
+          ) : (
+            <NumberField
+              label="threshold"
+              hint={detectionMethod === "dog" ? "band-pass signal-to-noise ratio" : "heatmap confidence, 0 to 1"}
+              value={threshold}
+              step={detectionMethod === "dog" ? 0.5 : 0.05}
+              onChange={setThreshold}
+              colors={colors}
+            />
+          )}
+          {detectionMethod === "dog" && (
+            <>
+              <NumberField label="sigma1" hint="inner Gaussian width, about the spot width" value={dogSigma1} step={0.1} onChange={setDogSigma1} colors={colors} />
+              <NumberField label="sigma2" hint="outer Gaussian width, a few times sigma1" value={dogSigma2} step={0.25} onChange={setDogSigma2} colors={colors} />
+            </>
+          )}
+          {detectionMethod === "neural" && (
+            <NumberField label="spot radius" hint="disk radius in pixels; 0 estimates it" value={spotRadius} step={0.5} onChange={setSpotRadius} colors={colors} />
+          )}
+          <NumberField label="min_spacing" value={minSpacing} step={0.5} onChange={setMinSpacing} colors={colors} />
+          {detectionMethod !== "neural" && (
+            <NumberField label="edge_boundary" value={edgeBoundary} onChange={setEdgeBoundary} colors={colors} />
+          )}
+          {usesTemplate && (
+            <NumberField label="upsample_factor" value={upsampleFactor} onChange={setUpsampleFactor} colors={colors} />
+          )}
+          <NumberField label="max_num_peaks" value={maxNumPeaks} onChange={setMaxNumPeaks} colors={colors} />
+          <NumberField label="preview_grid" hint="preview samples an N x N grid" value={previewGrid} onChange={setPreviewGrid} colors={colors} />
+          {detectionMethod !== "neural" && (
+            <Select
+              size="small"
+              value={subpixel}
+              onChange={(e) => setSubpixel(e.target.value)}
+              sx={{ width: 120, fontSize: 11, "& .MuiSelect-select": { py: 0.5, color: colors.text } }}
+            >
+              <MenuItem sx={{ fontSize: 11 }} value="none">none</MenuItem>
+              <MenuItem sx={{ fontSize: 11 }} value="parabolic">parabolic</MenuItem>
+              <MenuItem sx={{ fontSize: 11 }} value="upsample" disabled={!usesTemplate}>upsample</MenuItem>
+            </Select>
+          )}
+          {!usesTemplate && (
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={Boolean(maskBeamstop)}
+                  onChange={(e) => setMaskBeamstop(e.target.checked)}
+                />
+              }
+              label="mask beam stop"
+              slotProps={{ typography: { sx: { fontSize: 11, color: colors.text } } }}
+            />
+          )}
         </Stack>
         )}
 

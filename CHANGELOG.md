@@ -12,6 +12,11 @@ new `rcN` heading when that rc is published to TestPyPI.
   Bragg vector map with numbered candidates, basis selection by candidate
   index or direct placement, and a per-position lattice fit handed off to
   `StrainMap`.
+- `ShowBragg` gains a detection-method selector: template correlation, a
+  Difference-of-Gaussians band-pass, or the neural SpotUNet detector, with
+  their own controls and a beam-stop mask. The probe panel shows what the
+  chosen method thresholds. The neural weights download from em-database on
+  first use; `ShowBragg(..., model_path=...)` takes a local checkpoint.
 - Installation, Colab tutorial cells, and the verify snippet now install the
   TestPyPI wheel and import `load` from `quantem.gpu.io`. `quantem
   showdiffraction --demo` is documented as needing the public Fe3O4 hub folder,
