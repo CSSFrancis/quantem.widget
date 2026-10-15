@@ -13,7 +13,7 @@ from quantem.widget.showbragg import METHOD_DEFAULTS, ShowBragg
 pytest.importorskip("quantem.diffraction.spot_detection")
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.ml.spot_unet import SpotUNet
+from quantem.core.ml.spot_net import SpotNet
 
 SPOTS = [(9.3, 9.6), (9.1, 22.4), (22.7, 9.2), (22.6, 22.5), (16.2, 15.8)]
 
@@ -63,8 +63,8 @@ def test_dog_preview_and_full_detection(widget: ShowBragg) -> None:
 
 def test_neural_method_uses_a_local_checkpoint(tmp_path) -> None:
     torch.manual_seed(0)
-    path = tmp_path / "spot_unet.pt"
-    model = SpotUNet(base=4, levels=2)
+    path = tmp_path / "spot_net.pt"
+    model = SpotNet(base=4, levels=2)
     torch.save({"state_dict": model.state_dict(), "base": 4, "in_ch": 1, "levels": 2}, path)
 
     widget = ShowBragg(small_spot_dataset(), model=path)
@@ -80,10 +80,10 @@ def test_neural_method_uses_a_local_checkpoint(tmp_path) -> None:
 
 
 def test_center_step_toggles_reach_detect_disks(tmp_path) -> None:
-    widget = ShowBragg(small_spot_dataset(), model=tmp_path / "d.pt", refine_model="f5.pt")
+    widget = ShowBragg(small_spot_dataset(), model=tmp_path / "d.pt", refine_model="centernet.pt")
     widget.detection_method = "neural"
     kwargs = widget._method_kwargs()
-    assert kwargs["refine_centers"] == "f5.pt" and kwargs["friedel_partner"] is True
+    assert kwargs["refine_centers"] == "centernet.pt" and kwargs["friedel_partner"] is True
     widget.refine_centers = False
     widget.friedel_partner = False
     kwargs = widget._method_kwargs()
@@ -93,6 +93,6 @@ def test_center_step_toggles_reach_detect_disks(tmp_path) -> None:
 def test_neural_without_weights_reports_in_status(widget: ShowBragg, monkeypatch) -> None:
     from emdatabase import data
 
-    monkeypatch.delattr(data, "SpotUNetDiffraction", raising=False)
+    monkeypatch.delattr(data, "DE_SpotNet", raising=False)
     widget.detection_method = "neural"
-    assert "SpotUNetDiffraction" in widget.status and "model=" in widget.status
+    assert "DE_SpotNet" in widget.status and "model=" in widget.status

@@ -37,7 +37,7 @@ const CMAPS = ["inferno", "magma", "viridis", "plasma", "gray", "turbo"];
 const METHODS = [
   { value: "correlation", label: "template correlation" },
   { value: "dog", label: "difference of Gaussians" },
-  { value: "neural", label: "neural (SpotUNet)" },
+  { value: "neural", label: "neural (DE SpotNet)" },
 ] as const;
 const RESPONSE_CAPTIONS: Record<string, string> = {
   correlation: "correlation map",
@@ -763,7 +763,7 @@ function ShowBragg() {
             <>
               <NumberField label="spot radius" hint="disk radius in pixels; 0 estimates it" value={spotRadius} step={0.5} onChange={setSpotRadius} colors={colors} />
               <FormControlLabel
-                title="re-place each disk on the raw pattern with the center network (spots of 5 px radius or more)"
+                title="re-place each disk on the raw pattern with DE CenterNet (spots of 5 px radius or more)"
                 control={
                   <Switch
                     size="small"
@@ -775,7 +775,7 @@ function ShowBragg() {
                 slotProps={{ typography: { sx: { fontSize: 11, color: colors.text } } }}
               />
               <FormControlLabel
-                title="refine again with each disk's Friedel mirror (spots of 6-16 px radius)"
+                title="refine again with each disk's Friedel mirror, using DE FriedelNet (spots of 6-16 px radius)"
                 control={
                   <Switch
                     size="small"

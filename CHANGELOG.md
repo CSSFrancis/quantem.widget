@@ -13,10 +13,12 @@ new `rcN` heading when that rc is published to TestPyPI.
   index or direct placement, and a per-position lattice fit handed off to
   `StrainMap`.
 - `ShowBragg` gains a detection-method selector: template correlation, a
-  Difference-of-Gaussians band-pass, or the neural SpotUNet detector, with
-  their own controls and a beam-stop mask. The probe panel shows what the
-  chosen method thresholds. The neural weights download from em-database on
-  first use; `ShowBragg(..., model_path=...)` takes a local checkpoint.
+  Difference-of-Gaussians band-pass, or the neural DE SpotNet detector, with
+  their own controls and a beam-stop mask. For the neural method, switches turn
+  the two center steps (DE CenterNet and DE FriedelNet) on or off. The probe
+  panel shows what the chosen method thresholds. The networks' weights download
+  from em-database on first use; `ShowBragg(..., model=..., refine_model=...,
+  friedel_model=...)` take a detector name or local checkpoints.
 - Installation, Colab tutorial cells, and the verify snippet now install the
   TestPyPI wheel and import `load` from `quantem.gpu.io`. `quantem
   showdiffraction --demo` is documented as needing the public Fe3O4 hub folder,

@@ -17,13 +17,13 @@ from quantem.diffraction.disk_detection import SUBPIXEL_MODES
 from quantem.diffraction.strain import StrainMap
 
 try:
-    from quantem.diffraction.neural_disk_detection import load_spot_unet, neural_heatmap
+    from quantem.diffraction.neural_disk_detection import load_spot_net, neural_heatmap
     from quantem.diffraction.spot_detection import (
         detect_beamstop,
         difference_of_gaussians_snr,
     )
 except ImportError:  # a quantem without the template-free detectors
-    load_spot_unet = neural_heatmap = detect_beamstop = difference_of_gaussians_snr = None
+    load_spot_net = neural_heatmap = detect_beamstop = difference_of_gaussians_snr = None
 
 from quantem.widget.render import frame_to_rgb, rgb_to_png_bytes
 from quantem.widget.utils.array import to_numpy
@@ -55,12 +55,12 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     probe : array_like, optional
         Measured vacuum probe, required for template_source="probe".
     model : str or Path, optional
-        Detector for detection_method="neural": a name from
-        quantem.diffraction.neural_weights.DETECTOR_FILES or a local checkpoint.
-        None uses the default detector, downloaded from em-database.
+        DE SpotNet detector for detection_method="neural": "spotnet" (the default),
+        "dynamical", "production", "base16", or a local checkpoint. Named detectors
+        download from em-database.
     refine_model, friedel_model : str or Path, optional
-        Local checkpoints for the two center steps (refine_centers and
-        friedel_partner), instead of the em-database downloads.
+        Local checkpoints of DE CenterNet and DE FriedelNet for the two center steps
+        (refine_centers and friedel_partner), instead of the em-database downloads.
     device : str, default="cpu"
         Torch device passed through to BraggVectors.
     cmap : str, default="inferno"
@@ -239,7 +239,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         self._model = model
         self._refine_model = refine_model
         self._friedel_model = friedel_model
-        self._spot_unet = None
+        self._spot_net = None
 
         if self._bragg.template is None:
             self._build_template()
@@ -504,10 +504,10 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         }
 
     def _neural_model(self):
-        """The SpotUNet for detection_method="neural", loaded on first use."""
-        if self._spot_unet is None:
-            self._spot_unet = load_spot_unet(self._model, device=self._bragg.device)
-        return self._spot_unet
+        """The DE SpotNet detector for detection_method="neural", loaded on first use."""
+        if self._spot_net is None:
+            self._spot_net = load_spot_net(self._model, device=self._bragg.device)
+        return self._spot_net
 
     def _response_map(self, row: int, col: int) -> np.ndarray:
         """What the selected method thresholds, for the pattern at one scan position."""
