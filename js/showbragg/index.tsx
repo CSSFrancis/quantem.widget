@@ -394,6 +394,8 @@ function ShowBragg() {
   const [dogSigma2, setDogSigma2] = useModelState<number>("dog_sigma2");
   const [spotRadius, setSpotRadius] = useModelState<number>("spot_radius");
   const [maskBeamstop, setMaskBeamstop] = useModelState<boolean>("mask_beamstop");
+  const [refineCentres, setRefineCentres] = useModelState<boolean>("refine_centres");
+  const [friedelPartner, setFriedelPartner] = useModelState<boolean>("friedel_partner");
   const [minAbsIntensity, setMinAbsIntensity] = useModelState<number>("min_abs_intensity");
   const [minSpacing, setMinSpacing] = useModelState<number>("min_spacing");
   const [edgeBoundary, setEdgeBoundary] = useModelState<number>("edge_boundary");
@@ -758,7 +760,34 @@ function ShowBragg() {
             </>
           )}
           {detectionMethod === "neural" && (
-            <NumberField label="spot radius" hint="disk radius in pixels; 0 estimates it" value={spotRadius} step={0.5} onChange={setSpotRadius} colors={colors} />
+            <>
+              <NumberField label="spot radius" hint="disk radius in pixels; 0 estimates it" value={spotRadius} step={0.5} onChange={setSpotRadius} colors={colors} />
+              <FormControlLabel
+                title="re-place each disk on the raw pattern with the centre network (spots of 5 px radius or more)"
+                control={
+                  <Switch
+                    size="small"
+                    checked={Boolean(refineCentres)}
+                    onChange={(e) => setRefineCentres(e.target.checked)}
+                  />
+                }
+                label="refine centres"
+                slotProps={{ typography: { sx: { fontSize: 11, color: colors.text } } }}
+              />
+              <FormControlLabel
+                title="refine again with each disk's Friedel mirror (spots of 6-16 px radius)"
+                control={
+                  <Switch
+                    size="small"
+                    disabled={!refineCentres}
+                    checked={Boolean(friedelPartner) && Boolean(refineCentres)}
+                    onChange={(e) => setFriedelPartner(e.target.checked)}
+                  />
+                }
+                label="Friedel partner"
+                slotProps={{ typography: { sx: { fontSize: 11, color: colors.text } } }}
+              />
+            </>
           )}
           <NumberField label="min_spacing" value={minSpacing} step={0.5} onChange={setMinSpacing} colors={colors} />
           {detectionMethod !== "neural" && (

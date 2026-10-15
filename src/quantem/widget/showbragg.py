@@ -54,9 +54,13 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         detection kept.
     probe : array_like, optional
         Measured vacuum probe, required for template_source="probe".
-    model_path : str or Path, optional
-        Local SpotUNet checkpoint for detection_method="neural", instead of the
-        em-database download.
+    model : str or Path, optional
+        Detector for detection_method="neural": a name from
+        quantem.diffraction.neural_weights.DETECTOR_FILES or a local checkpoint.
+        None uses the default detector, downloaded from em-database.
+    refine_model, friedel_model : str or Path, optional
+        Local checkpoints for the two centre steps (refine_centres and
+        friedel_partner), instead of the em-database downloads.
     device : str, default="cpu"
         Torch device passed through to BraggVectors.
     cmap : str, default="inferno"
@@ -136,6 +140,8 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     dog_sigma2 = traitlets.Float(2.0).tag(sync=True)
     spot_radius = traitlets.Float(0.0).tag(sync=True)
     mask_beamstop = traitlets.Bool(False).tag(sync=True)
+    refine_centres = traitlets.Bool(True).tag(sync=True)
+    friedel_partner = traitlets.Bool(True).tag(sync=True)
     min_abs_intensity = traitlets.Float(0.0).tag(sync=True)
     min_spacing = traitlets.Float(0.0).tag(sync=True)
     edge_boundary = traitlets.Int(1).tag(sync=True)
@@ -198,7 +204,9 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         data,
         *,
         probe=None,
-        model_path=None,
+        model=None,
+        refine_model=None,
+        friedel_model=None,
         device: str = "cpu",
         cmap: str = "inferno",
         log_scale: bool = False,
@@ -228,7 +236,9 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
 
         dataset = self._bragg.dataset
         self._probe = None if probe is None else to_numpy(probe, dtype=np.float32)
-        self._model_path = model_path
+        self._model = model
+        self._refine_model = refine_model
+        self._friedel_model = friedel_model
         self._spot_unet = None
 
         if self._bragg.template is None:
@@ -488,13 +498,15 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             "threshold": float(self.threshold),
             "spot_diameter": 2.0 * float(self.spot_radius) or None,
             "mask": mask,
-            "model_path": self._model_path,
+            "model": self._model,
+            "refine_centres": (self._refine_model or True) if self.refine_centres else False,
+            "friedel_partner": (self._friedel_model or True) if self.friedel_partner else False,
         }
 
     def _neural_model(self):
         """The SpotUNet for detection_method="neural", loaded on first use."""
         if self._spot_unet is None:
-            self._spot_unet = load_spot_unet(self._model_path, device=self._bragg.device)
+            self._spot_unet = load_spot_unet(self._model, device=self._bragg.device)
         return self._spot_unet
 
     def _response_map(self, row: int, col: int) -> np.ndarray:

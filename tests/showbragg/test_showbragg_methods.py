@@ -67,15 +67,27 @@ def test_neural_method_uses_a_local_checkpoint(tmp_path) -> None:
     model = SpotUNet(base=4, levels=2)
     torch.save({"state_dict": model.state_dict(), "base": 4, "in_ch": 1, "levels": 2}, path)
 
-    widget = ShowBragg(small_spot_dataset(), model_path=path)
+    widget = ShowBragg(small_spot_dataset(), model=path)
     widget.detection_method = "neural"
     assert widget.status == ""
     assert len(widget.probe_correlation_png) > 0  # the network's confidence map
 
     widget.threshold = 0.0  # a random network carries no meaning; exercise every stage
+    widget.refine_centres = False
     found = widget.detect(positions=[(0, 0)])
-    assert found[0].numpy().shape[1] == 3
+    assert found[0].numpy().shape[1] == 5  # [q_row, q_col, intensity, confidence, sigma]
     assert widget.bragg.peaks is None
+
+
+def test_centre_step_toggles_reach_detect_disks(tmp_path) -> None:
+    widget = ShowBragg(small_spot_dataset(), model=tmp_path / "d.pt", refine_model="f5.pt")
+    widget.detection_method = "neural"
+    kwargs = widget._method_kwargs()
+    assert kwargs["refine_centres"] == "f5.pt" and kwargs["friedel_partner"] is True
+    widget.refine_centres = False
+    widget.friedel_partner = False
+    kwargs = widget._method_kwargs()
+    assert kwargs["refine_centres"] is False and kwargs["friedel_partner"] is False
 
 
 def test_neural_without_weights_reports_in_status(widget: ShowBragg, monkeypatch) -> None:
@@ -83,4 +95,4 @@ def test_neural_without_weights_reports_in_status(widget: ShowBragg, monkeypatch
 
     monkeypatch.delattr(data, "SpotUNetDiffraction", raising=False)
     widget.detection_method = "neural"
-    assert "model_path" in widget.status
+    assert "SpotUNetDiffraction" in widget.status and "model=" in widget.status
