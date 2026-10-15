@@ -73,21 +73,21 @@ def test_neural_method_uses_a_local_checkpoint(tmp_path) -> None:
     assert len(widget.probe_correlation_png) > 0  # the network's confidence map
 
     widget.threshold = 0.0  # a random network carries no meaning; exercise every stage
-    widget.refine_centres = False
+    widget.refine_centers = False
     found = widget.detect(positions=[(0, 0)])
     assert found[0].numpy().shape[1] == 5  # [q_row, q_col, intensity, confidence, sigma]
     assert widget.bragg.peaks is None
 
 
-def test_centre_step_toggles_reach_detect_disks(tmp_path) -> None:
+def test_center_step_toggles_reach_detect_disks(tmp_path) -> None:
     widget = ShowBragg(small_spot_dataset(), model=tmp_path / "d.pt", refine_model="f5.pt")
     widget.detection_method = "neural"
     kwargs = widget._method_kwargs()
-    assert kwargs["refine_centres"] == "f5.pt" and kwargs["friedel_partner"] is True
-    widget.refine_centres = False
+    assert kwargs["refine_centers"] == "f5.pt" and kwargs["friedel_partner"] is True
+    widget.refine_centers = False
     widget.friedel_partner = False
     kwargs = widget._method_kwargs()
-    assert kwargs["refine_centres"] is False and kwargs["friedel_partner"] is False
+    assert kwargs["refine_centers"] is False and kwargs["friedel_partner"] is False
 
 
 def test_neural_without_weights_reports_in_status(widget: ShowBragg, monkeypatch) -> None:

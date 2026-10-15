@@ -394,7 +394,7 @@ function ShowBragg() {
   const [dogSigma2, setDogSigma2] = useModelState<number>("dog_sigma2");
   const [spotRadius, setSpotRadius] = useModelState<number>("spot_radius");
   const [maskBeamstop, setMaskBeamstop] = useModelState<boolean>("mask_beamstop");
-  const [refineCentres, setRefineCentres] = useModelState<boolean>("refine_centres");
+  const [refineCenters, setRefineCenters] = useModelState<boolean>("refine_centers");
   const [friedelPartner, setFriedelPartner] = useModelState<boolean>("friedel_partner");
   const [minAbsIntensity, setMinAbsIntensity] = useModelState<number>("min_abs_intensity");
   const [minSpacing, setMinSpacing] = useModelState<number>("min_spacing");
@@ -763,15 +763,15 @@ function ShowBragg() {
             <>
               <NumberField label="spot radius" hint="disk radius in pixels; 0 estimates it" value={spotRadius} step={0.5} onChange={setSpotRadius} colors={colors} />
               <FormControlLabel
-                title="re-place each disk on the raw pattern with the centre network (spots of 5 px radius or more)"
+                title="re-place each disk on the raw pattern with the center network (spots of 5 px radius or more)"
                 control={
                   <Switch
                     size="small"
-                    checked={Boolean(refineCentres)}
-                    onChange={(e) => setRefineCentres(e.target.checked)}
+                    checked={Boolean(refineCenters)}
+                    onChange={(e) => setRefineCenters(e.target.checked)}
                   />
                 }
-                label="refine centres"
+                label="refine centers"
                 slotProps={{ typography: { sx: { fontSize: 11, color: colors.text } } }}
               />
               <FormControlLabel
@@ -779,8 +779,8 @@ function ShowBragg() {
                 control={
                   <Switch
                     size="small"
-                    disabled={!refineCentres}
-                    checked={Boolean(friedelPartner) && Boolean(refineCentres)}
+                    disabled={!refineCenters}
+                    checked={Boolean(friedelPartner) && Boolean(refineCenters)}
                     onChange={(e) => setFriedelPartner(e.target.checked)}
                   />
                 }

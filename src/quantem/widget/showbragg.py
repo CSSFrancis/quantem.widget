@@ -59,7 +59,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         quantem.diffraction.neural_weights.DETECTOR_FILES or a local checkpoint.
         None uses the default detector, downloaded from em-database.
     refine_model, friedel_model : str or Path, optional
-        Local checkpoints for the two centre steps (refine_centres and
+        Local checkpoints for the two center steps (refine_centers and
         friedel_partner), instead of the em-database downloads.
     device : str, default="cpu"
         Torch device passed through to BraggVectors.
@@ -140,7 +140,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     dog_sigma2 = traitlets.Float(2.0).tag(sync=True)
     spot_radius = traitlets.Float(0.0).tag(sync=True)
     mask_beamstop = traitlets.Bool(False).tag(sync=True)
-    refine_centres = traitlets.Bool(True).tag(sync=True)
+    refine_centers = traitlets.Bool(True).tag(sync=True)
     friedel_partner = traitlets.Bool(True).tag(sync=True)
     min_abs_intensity = traitlets.Float(0.0).tag(sync=True)
     min_spacing = traitlets.Float(0.0).tag(sync=True)
@@ -499,7 +499,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             "spot_diameter": 2.0 * float(self.spot_radius) or None,
             "mask": mask,
             "model": self._model,
-            "refine_centres": (self._refine_model or True) if self.refine_centres else False,
+            "refine_centers": (self._refine_model or True) if self.refine_centers else False,
             "friedel_partner": (self._friedel_model or True) if self.friedel_partner else False,
         }
 
