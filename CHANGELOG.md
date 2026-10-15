@@ -12,13 +12,20 @@ new `rcN` heading when that rc is published to TestPyPI.
   Bragg vector map with numbered candidates, basis selection by candidate
   index or direct placement, and a per-position lattice fit handed off to
   `StrainMap`.
-- `ShowBragg` gains a detection-method selector: template correlation, a
-  Difference-of-Gaussians band-pass, or the neural DE SpotNet detector, with
-  their own controls and a beam-stop mask. For the neural method, switches turn
-  the two center steps (DE CenterNet and DE FriedelNet) on or off. The probe
-  panel shows what the chosen method thresholds. The networks' weights download
-  from em-database on first use; `ShowBragg(..., model=..., refine_model=...,
-  friedel_model=...)` take a detector name or local checkpoints.
+- `ShowBragg` opens on a compact live view: the navigator with a draggable
+  crosshair (arrow keys step it), the pattern under it with its detected disks,
+  and the detection controls. The pattern is detected again on a background
+  thread as the crosshair moves, newest position first. Detection methods are
+  template correlation, a Difference-of-Gaussians band-pass, or the neural
+  DE SpotNet detector (with its DE CenterNet / DE FriedelNet center steps and a
+  model menu); the rest of the workflow sits in collapsed sections below.
+- `ShowBragg` can teach the neural detector: click a detection to mark it
+  wrong (again: right), or empty pattern to mark a missed disk, then Teach
+  fine-tunes a copy on the marks and switches to it; `save_model` writes it
+  for `model=` later.
+- Fix `ShowBragg` ignoring every change made in the browser: its panel-message
+  handler was named `_handle_msg`, which replaced the widget's own handler for
+  frontend state.
 - Installation, Colab tutorial cells, and the verify snippet now install the
   TestPyPI wheel and import `load` from `quantem.gpu.io`. `quantem
   showdiffraction --demo` is documented as needing the public Fe3O4 hub folder,

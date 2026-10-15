@@ -3,6 +3,9 @@
 import base64
 import json
 import pathlib
+import re
+import threading
+import time
 from typing import Any
 
 import anywidget
@@ -17,15 +20,28 @@ from quantem.diffraction.disk_detection import SUBPIXEL_MODES
 from quantem.diffraction.strain import StrainMap
 
 try:
-    from quantem.diffraction.neural_disk_detection import load_spot_net, neural_heatmap
+    from quantem.diffraction.neural_disk_detection import (
+        counts_radius,
+        load_spot_net,
+        neural_heatmap,
+        save_spot_net,
+    )
     from quantem.diffraction.spot_detection import (
         detect_beamstop,
         difference_of_gaussians_snr,
     )
 except ImportError:  # a quantem without the template-free detectors
     load_spot_net = neural_heatmap = detect_beamstop = difference_of_gaussians_snr = None
+    counts_radius = save_spot_net = None
 
 from quantem.widget.render import frame_to_rgb, rgb_to_png_bytes
+from quantem.widget.showbragg_live import (
+    BUILT_IN_DETECTORS,
+    LatestOnlyWorker,
+    TeachMarks,
+    icon_data_url,
+    preferred_input_icon,
+)
 from quantem.widget.utils.array import to_numpy
 from quantem.widget.utils.static_fallback import StaticFallbackMixin
 from quantem.widget.utils.traits import reject_unknown_kwargs
@@ -33,6 +49,7 @@ from quantem.widget.utils.ui import UiMode, resolve_ui_mode
 
 TEMPLATE_SOURCES = ("synthetic", "data", "probe")
 STAGE_STATES = ("idle", "preview", "running", "done", "error")
+NAVIGATOR_KINDS = ("sum", "adf")
 DETECTION_METHODS = ("correlation", "dog", "neural")
 # Switching method resets the controls whose meaning changes with it: the
 # Difference-of-Gaussians threshold is a signal-to-noise ratio, the neural one a
@@ -54,10 +71,14 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         detection kept.
     probe : array_like, optional
         Measured vacuum probe, required for template_source="probe".
-    model : str or Path, optional
+    model : str, Path or SpotNet, optional
         DE SpotNet detector for detection_method="neural": "spotnet" (the default),
-        "dynamical", "production", "base16", or a local checkpoint. Named detectors
-        download from em-database.
+        "dynamical", "production", "base16", a local checkpoint (a taught model saved
+        earlier, say), or a model in memory. Named detectors download from
+        em-database.
+    replay : str or Path, optional
+        The replay buffer teaching mixes in (de_spotnet_replay.npz). ``None`` uses the
+        published one when it can be fetched and otherwise teaches without it.
     refine_model, friedel_model : str or Path, optional
         Local checkpoints of DE CenterNet and DE FriedelNet for the two center steps
         (refine_centers and friedel_partner), instead of the em-database downloads.
@@ -89,6 +110,17 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
 
     Notes
     -----
+    The top row is the live view: drag the crosshair on the navigator (or step it with
+    the arrow keys) and the pattern under it is detected again on a background thread,
+    the newest position always winning, so a fast drag never queues stale work. Any
+    detection setting re-detects the same pattern.
+
+    With the neural method, clicking the pattern teaches the detector: a click on a
+    detection marks it wrong, a second click confirms it, a third clears the mark;
+    a click on empty pattern marks a disk the detector missed. Teach fine-tunes a copy
+    of the detector on every mark so far (quantem.diffraction.neural_adapt) and
+    switches to it; Revert goes back; save_model writes it for model= later.
+
     template_radius, max_peak_shift and num_candidates use 0 as the sentinel for
     "let the data choose"; none of the three is meaningful at zero. num_candidates
     resolves to however many peaks the busiest scan position detected.
@@ -131,6 +163,24 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     probe_diffraction_png = traitlets.Bytes(b"").tag(sync=True)
     probe_correlation_png = traitlets.Bytes(b"").tag(sync=True)
 
+    # The live view: navigator, the pattern under the crosshair and its detections
+    navigator_kind = traitlets.Enum(NAVIGATOR_KINDS, default_value="sum").tag(sync=True)
+    navigator_png = traitlets.Bytes(b"").tag(sync=True)
+    pattern_png = traitlets.Bytes(b"").tag(sync=True)
+    pattern_log = traitlets.Bool(True).tag(sync=True)
+    show_response = traitlets.Bool(False).tag(sync=True)
+    spots = traitlets.List(default_value=[]).tag(sync=True)
+    spots_position = traitlets.List(traitlets.Int(), default_value=[]).tag(sync=True)
+    spot_display_radius = traitlets.Float(4.0).tag(sync=True)
+    detect_ms = traitlets.Float(0.0).tag(sync=True)
+    live_status = traitlets.Unicode("").tag(sync=True)
+
+    # Teaching the neural detector
+    models = traitlets.List(default_value=[]).tag(sync=True)
+    neural_model = traitlets.Unicode("spotnet").tag(sync=True)
+    teach_marks = traitlets.Dict(default_value={}).tag(sync=True)
+    teach_state = traitlets.Dict(default_value={}).tag(sync=True)
+
     # Stages 3 and 4, detection
     detection_method = traitlets.Enum(DETECTION_METHODS, default_value="correlation").tag(
         sync=True
@@ -142,6 +192,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
     mask_beamstop = traitlets.Bool(False).tag(sync=True)
     refine_centers = traitlets.Bool(True).tag(sync=True)
     friedel_partner = traitlets.Bool(True).tag(sync=True)
+    neighbor_refine = traitlets.Bool(False).tag(sync=True)
     min_abs_intensity = traitlets.Float(0.0).tag(sync=True)
     min_spacing = traitlets.Float(0.0).tag(sync=True)
     edge_boundary = traitlets.Int(1).tag(sync=True)
@@ -181,11 +232,24 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         "template_subtract_mean",
         "template_roi",
     )
-    _RESPONSE_TRAITS = (
+    _LIVE_TRAITS = (
+        "probe_position",
         "dog_sigma1",
         "dog_sigma2",
         "spot_radius",
         "mask_beamstop",
+        "threshold",
+        "min_abs_intensity",
+        "min_spacing",
+        "edge_boundary",
+        "subpixel",
+        "upsample_factor",
+        "max_num_peaks",
+        "refine_centers",
+        "friedel_partner",
+        "neural_model",
+        "show_response",
+        "pattern_log",
     )
     _CANDIDATE_TRAITS = (
         "num_candidates",
@@ -207,6 +271,7 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         model=None,
         refine_model=None,
         friedel_model=None,
+        replay=None,
         device: str = "cpu",
         cmap: str = "inferno",
         log_scale: bool = False,
@@ -222,6 +287,10 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         **kwargs,
     ) -> None:
         reject_unknown_kwargs(type(self), kwargs)
+        method = kwargs.get("detection_method")
+        if method in METHOD_DEFAULTS:
+            # The method's own defaults, unless the caller set them too.
+            kwargs = {**METHOD_DEFAULTS[method], **kwargs}
         super().__init__(**kwargs)
 
         if isinstance(data, BraggVectors):
@@ -236,10 +305,24 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
 
         dataset = self._bragg.dataset
         self._probe = None if probe is None else to_numpy(probe, dtype=np.float32)
-        self._model = model
         self._refine_model = refine_model
         self._friedel_model = friedel_model
-        self._spot_net = None
+        self._replay = replay
+        self._custom_model = None
+        if model is not None and str(model) in {name for name, _, _ in BUILT_IN_DETECTORS}:
+            self.neural_model = str(model)
+        elif model is not None:
+            self._custom_model = model
+            self.neural_model = "custom"
+        self._taught = None
+        self._taught_icon = ""
+        self._teach_base = None
+        self._marks = TeachMarks()
+        self._spot_nets: dict[str, Any] = {}
+        self._detect_lock = threading.Lock()
+        self._estimated_radius: float | None = None
+        self._live = LatestOnlyWorker(self._apply_live)
+        self._teacher = LatestOnlyWorker(self._apply_teach, name="showbragg-teach")
 
         if self._bragg.template is None:
             self._build_template()
@@ -276,7 +359,8 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             self.log_scale = bool(log_scale)
             self.has_probe = self._probe is not None
             self._render_template()
-            self._render_probe()
+            self._render_navigator()
+            self._publish_models()
             if self._bragg.peaks is not None:
                 self.detection_state = "done"
                 self._update_bvm()
@@ -286,12 +370,13 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
                 self._render_fit()
 
         self.observe(self._on_template_change, names=self._TEMPLATE_TRAITS)
-        self.observe(self._on_probe_change, names="probe_position")
         self.observe(self._on_method_change, names="detection_method")
-        self.observe(self._on_probe_change, names=self._RESPONSE_TRAITS)
+        self.observe(self._on_live_change, names=self._LIVE_TRAITS)
+        self.observe(self._on_navigator_change, names="navigator_kind")
         self.observe(self._on_basis_change, names=self._CANDIDATE_TRAITS)
         self.observe(self._on_display_change, names=["cmap", "log_scale"])
-        self.on_msg(self._handle_msg)
+        self.on_msg(self._on_panel_message)
+        self._request_live()
 
         try:
             from importlib.metadata import version
@@ -354,6 +439,118 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             return None
         return (self._bragg.origin, self._bragg.g1, self._bragg.g2)
 
+    @property
+    def taught_model(self):
+        """The detector taught on the marks, or None before Teach."""
+        return self._taught
+
+    @property
+    def marks(self) -> TeachMarks:
+        """The teach marks, per scan position."""
+        return self._marks
+
+    def mark(self, row: float, col: float, position: tuple[int, int] | None = None) -> str:
+        """Click the pattern at ``(row, col)`` detector pixels, as the panel does.
+
+        On a detection the click marks it wrong, then confirmed, then clears the mark;
+        on empty pattern it marks a missed disk, then clears it.
+
+        Returns
+        -------
+        str
+            "wrong", "confirmed", "missed" or "removed".
+        """
+        position = tuple(position or self.probe_position)
+        shown = np.asarray(self.spots, np.float64).reshape(-1, 3) if self.spots else np.zeros((0, 3))
+        if list(position) != list(self.spots_position):
+            shown = np.zeros((0, 3))
+        reach = max(3.0, float(self.spot_display_radius))
+        result = self._marks.click(position, float(row), float(col), shown[:, :2], reach)
+        if self._teach_base is None and self.neural_model != "taught":
+            self._teach_base = self.neural_model
+        self._publish_marks(f"Marked {result}.")
+        return result
+
+    def teach(self) -> None:
+        """Fine-tune a copy of the detector on every mark so far, then switch to it.
+
+        Runs on a background thread in a live kernel; the status line reports when it
+        is done.
+        """
+        if not len(self._marks):
+            raise ValueError("Mark a wrong detection or a missed disk first.")
+        if str(self.detection_method) != "neural":
+            raise ValueError("Teaching applies to the neural detector.")
+        base_name = self._teach_base or self.neural_model
+        settings = {
+            "spot_radius": float(self.spot_radius) or None,
+            "min_spacing": int(round(float(self.min_spacing))),
+            "threshold": float(self.threshold),
+        }
+        positions = self._marks.positions()
+        marks = [self._marks.at(p) for p in positions]
+        patterns = [np.asarray(self._bragg.dataset.array[r, c], np.float32) for r, c in positions]
+        base = self._spot_net(base_name)
+        replay = self._replay
+        self._set_teach_state(busy=True)
+        self.live_status = "Teaching..."
+
+        def job():
+            from quantem.diffraction.neural_adapt import teach_spot_net
+
+            bank = replay
+            note = ""
+            if bank is None:
+                try:
+                    from quantem.diffraction.neural_weights import (
+                        REPLAY_ENTRY,
+                        entry_path,
+                    )
+
+                    bank = entry_path(REPLAY_ENTRY)
+                except Exception:
+                    bank = None
+                    note = " (no replay buffer: pass ShowBragg(replay=...) to keep it general)"
+            model, report = teach_spot_net(base, patterns, marks, replay=bank, **settings)
+            return {"model": model, "report": report, "icon": preferred_input_icon(model),
+                    "base": base_name, "note": note}
+
+        self._teacher.submit(job)
+
+    def revert_teaching(self) -> None:
+        """Back to the detector the marks were made against; the marks are cleared."""
+        if self._teach_base is not None:
+            self.neural_model = self._teach_base
+        self._taught = None
+        self._teach_base = None
+        self._marks.clear()
+        self._set_teach_state(taught=False, summary="", original_f1=None, original_f1_base=None)
+        self._publish_models()
+        self._publish_marks("Back to the original detector.")
+
+    def save_model(self, path: str | pathlib.Path | None = None) -> pathlib.Path:
+        """Write the taught detector as a checkpoint ``model=`` can load later.
+
+        Parameters
+        ----------
+        path : str or Path, optional
+            The ``.pt`` file; by default ``<title>_spotnet_taught.pt`` here.
+
+        Returns
+        -------
+        Path
+            The written file.
+        """
+        if self._taught is None:
+            raise ValueError("Teach first: there is no taught detector to save.")
+        if path is None:
+            stem = re.sub(r"[^A-Za-z0-9_-]+", "_", self.title or "dataset").strip("_") or "dataset"
+            path = pathlib.Path(f"{stem}_spotnet_taught.pt")
+        written = save_spot_net(self._taught, path)
+        self._set_teach_state(saved=str(written))
+        self.live_status = f"Saved the taught detector to {written}."
+        return written
+
     def detect(self, positions: list[tuple[int, int]] | None = None, **kwargs) -> Vector:
         """Run disk detection with the current detection traits.
 
@@ -372,13 +569,16 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         """
         detect_kwargs = {**self._method_kwargs(), **kwargs}
         preview = positions is not None
+        if not preview:
+            detect_kwargs.setdefault("neighbor_refine", bool(self.neighbor_refine))
 
         self.detection_state = "preview" if preview else "running"
         self.status = ""
         try:
-            found = self._bragg.detect_disks(
-                positions=positions, progressbar=False, **detect_kwargs
-            )
+            with self._detect_lock:
+                found = self._bragg.detect_disks(
+                    positions=positions, progressbar=False, **detect_kwargs
+                )
         except Exception as exc:
             self.detection_state = "error"
             self.status = f"Detection failed: {exc}"
@@ -498,16 +698,32 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             "threshold": float(self.threshold),
             "spot_diameter": 2.0 * float(self.spot_radius) or None,
             "mask": mask,
-            "model": self._model,
+            "model": self._model_argument(self.neural_model),
             "refine_centers": (self._refine_model or True) if self.refine_centers else False,
             "friedel_partner": (self._friedel_model or True) if self.friedel_partner else False,
         }
 
+    def _model_argument(self, name: str):
+        """What detect_disks(model=...) takes for a model-menu entry."""
+        if name == "taught" and self._taught is not None:
+            return self._taught
+        if name == "custom" and self._custom_model is not None:
+            return self._custom_model
+        return name
+
+    def _spot_net(self, name: str):
+        """The DE SpotNet for a model-menu entry, loaded on first use."""
+        if name == "taught" and self._taught is not None:
+            return self._taught
+        if name not in self._spot_nets:
+            self._spot_nets[name] = load_spot_net(
+                self._model_argument(name), device=self._bragg.device
+            )
+        return self._spot_nets[name]
+
     def _neural_model(self):
-        """The DE SpotNet detector for detection_method="neural", loaded on first use."""
-        if self._spot_net is None:
-            self._spot_net = load_spot_net(self._model, device=self._bragg.device)
-        return self._spot_net
+        """The DE SpotNet detector in use for detection_method="neural"."""
+        return self._spot_net(self.neural_model)
 
     def _response_map(self, row: int, col: int) -> np.ndarray:
         """What the selected method thresholds, for the pattern at one scan position."""
@@ -541,6 +757,174 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         if not self.mask_beamstop:
             return None
         return detect_beamstop(np.asarray(self._bragg.dataset.dp_mean.array))
+
+    # The live view
+
+    def _display_radius(self) -> float:
+        """Radius the detections are drawn at: the spot size when set, else the disk
+        size estimated once from the mean pattern."""
+        if float(self.spot_radius) > 0:
+            return float(self.spot_radius)
+        if self._estimated_radius is None:
+            mean = np.asarray(self._bragg.dataset.dp_mean.array, np.float32)
+            self._estimated_radius = (
+                float(counts_radius(mean, None)) if counts_radius is not None else 4.0
+            )
+        return self._estimated_radius
+
+    def _request_live(self) -> None:
+        """Detect the pattern under the crosshair again, off the kernel thread."""
+        position = (int(self.probe_position[0]), int(self.probe_position[1]))
+        try:
+            kwargs = self._method_kwargs()
+        except Exception as exc:
+            self.live_status = str(exc)
+            return
+        show_response = bool(self.show_response)
+        pattern_log = bool(self.pattern_log)
+        method = str(self.detection_method)
+
+        def job():
+            started = time.perf_counter()
+            with self._detect_lock:
+                found = self._bragg.detect_disks(
+                    positions=[position], progressbar=False, **kwargs
+                )[0].numpy()
+            milliseconds = 1000.0 * (time.perf_counter() - started)
+            pattern = np.asarray(self._bragg.dataset.array[position], dtype=float)
+            if show_response:
+                image = self._render_frame(self._response_map(*position), log=False)
+            else:
+                image = self._render_frame(pattern, log=pattern_log)
+            columns = [0, 1, 3] if found.shape[1] >= 4 else [0, 1, 2]
+            return {
+                "position": list(position),
+                "method": method,
+                "spots": found[:, columns].tolist(),
+                "milliseconds": milliseconds,
+                "image": image,
+                "response": show_response,
+            }
+
+        self._live.submit(job)
+
+    def _apply_live(self, result) -> None:
+        if isinstance(result, Exception):
+            self.live_status = f"Detection failed: {result}"
+            return
+        if result["position"] != list(self.probe_position):
+            return  # superseded: a newer position is already queued
+        with self.hold_sync():
+            self.spots = result["spots"]
+            self.spots_position = result["position"]
+            self.spot_display_radius = self._display_radius()
+            self.detect_ms = float(result["milliseconds"])
+            self.pattern_png = result["image"]
+            if result["response"]:
+                self.probe_correlation_png = result["image"]
+            else:
+                self.probe_diffraction_png = result["image"]
+            row, col = result["position"]
+            self.live_status = (
+                f"{len(result['spots'])} spots at ({row}, {col}) · "
+                f"{result['milliseconds']:.0f} ms"
+            )
+
+    def _apply_teach(self, result) -> None:
+        if isinstance(result, Exception):
+            self._set_teach_state(busy=False)
+            self.live_status = f"Teaching failed: {result}"
+            return
+        report = result["report"]
+        self._taught = result["model"]
+        self._taught_icon = result["icon"]
+        self._teach_base = result["base"]
+        learned, total = report["marks_learned"], report["marks_total"]
+        verdict = "all marks learned" if learned == total else f"{learned} of {total} marks learned"
+        general = ""
+        if report["original_f1"] is not None:
+            general = (
+                f" · general F1 {report['original_f1']:.2f}"
+                f" (was {report['original_f1_base']:.2f})"
+            )
+        self._set_teach_state(
+            busy=False,
+            taught=True,
+            learned=learned,
+            total=total,
+            original_f1=report["original_f1"],
+            original_f1_base=report["original_f1_base"],
+        )
+        summary = (
+            f"Taught in {report['seconds']:.1f} s ({report['steps']} steps): "
+            f"{verdict}{general}{result['note']}"
+        )
+        self._set_teach_state(summary=summary)
+        self._publish_models()
+        self.live_status = summary
+        self.neural_model = "taught"
+
+    def _set_teach_state(self, **changes) -> None:
+        state = {**self.teach_state, **changes}
+        state.update(self._marks.counts())
+        self.teach_state = state
+
+    def _publish_marks(self, message: str) -> None:
+        with self.hold_sync():
+            self.teach_marks = self._marks.to_trait()
+            self._set_teach_state()
+            self.live_status = message
+
+    def _publish_models(self) -> None:
+        """The model menu: the built-in detectors, then a custom or taught one."""
+        entries = [
+            {"id": name, "label": label, "subtitle": subtitle, "icon": icon_data_url(name)}
+            for name, label, subtitle in BUILT_IN_DETECTORS
+        ]
+        if self._custom_model is not None:
+            stem = pathlib.Path(str(self._custom_model)).stem
+            built_in = {
+                ("de_spotnet" if name == "spotnet" else f"de_spotnet_{name}"): (name, label)
+                for name, label, _ in BUILT_IN_DETECTORS
+            }
+            if stem in built_in:
+                name, label = built_in[stem]
+                entry = {"label": f"{label} (local file)", "icon": icon_data_url(name)}
+            else:
+                entry = {"label": stem, "icon": ""}
+            entries.append({"id": "custom", "subtitle": str(self._custom_model), **entry})
+        if self._taught is not None:
+            entries.append(
+                {
+                    "id": "taught",
+                    "label": f"Taught: {self.title or 'this dataset'}",
+                    "subtitle": f"from {self._teach_base} on {len(self._marks)} marks",
+                    "icon": self._taught_icon,
+                    "taught": True,
+                }
+            )
+        self.models = entries
+
+    def _navigator_image(self) -> np.ndarray:
+        """Virtual image of the scan: the summed pattern, or an annular dark field from
+        twice the central beam radius outward."""
+        data = np.asarray(self._bragg.dataset.array)
+        if self.navigator_kind == "sum":
+            return data.sum(axis=(-2, -1))
+        mean = data.mean(axis=(0, 1))
+        rows, cols = np.indices(mean.shape)
+        peak = np.unravel_index(np.argmax(mean), mean.shape)
+        radius = 2.0 * self._display_radius()
+        annulus = np.hypot(rows - peak[0], cols - peak[1]) > radius
+        return (data * annulus).sum(axis=(-2, -1))
+
+    def _render_navigator(self) -> None:
+        self.navigator_png = self._render_frame(self._navigator_image(), log=False)
+
+    def _render_frame(self, frame, *, log: bool) -> bytes:
+        return rgb_to_png_bytes(
+            frame_to_rgb(np.asarray(frame, dtype=float), cmap=self.cmap, log_scale=log)
+        )
 
     def _build_template(self) -> None:
         """Rebuild the correlation template from the current template traits."""
@@ -688,13 +1072,6 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
             self.template_shape = [int(crop.shape[0]), int(crop.shape[1])]
             self.template_png = self._render(crop)
 
-    def _render_probe(self) -> None:
-        row, col = self.probe_position
-        pattern = np.asarray(self._bragg.dataset.array[row, col])
-        with self.hold_sync():
-            self.probe_diffraction_png = self._render(pattern)
-            self.probe_correlation_png = self._render(self._response_map(row, col))
-
     def _update_bvm(self) -> None:
         bvm = self._bragg.compute_bvm(float(self.bvm_sampling))
         self.bvm_png = self._render(bvm.array)
@@ -715,22 +1092,20 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         with self.hold_sync():
             self.status = ""
             self._render_template()
-            self._render_probe()
+        self._request_live()
 
-    def _on_probe_change(self, _change) -> None:
-        try:
-            self._render_probe()
-        except Exception as exc:
-            self.status = str(exc)
-            return
-        self.status = ""
+    def _on_live_change(self, _change) -> None:
+        self._request_live()
+
+    def _on_navigator_change(self, _change) -> None:
+        self._render_navigator()
 
     def _on_method_change(self, change) -> None:
         with self.hold_sync():
             for name, value in METHOD_DEFAULTS[change["new"]].items():
                 setattr(self, name, value)
             self.preview_peaks = ""
-            self._on_probe_change(change)
+        self._request_live()
 
     def _on_basis_change(self, _change) -> None:
         if getattr(self, "_resolving_basis", False):
@@ -738,15 +1113,18 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
         self._choose_basis()
 
     def _on_display_change(self, _change) -> None:
+        self._request_live()
         with self.hold_sync():
             self._render_template()
-            self._render_probe()
+            self._render_navigator()
             if self._bragg.bvm is not None:
                 self.bvm_png = self._render(self._bragg.bvm.array)
             if self._bragg.g1_array is not None:
                 self._render_fit()
 
-    def _handle_msg(self, _widget: Any, content: dict[str, Any], _buffers: list[Any]) -> None:
+    def _on_panel_message(
+        self, _widget: Any, content: dict[str, Any], _buffers: list[Any]
+    ) -> None:
         """Panel actions. Errors land in status instead of the kernel."""
         action = content.get("type")
         try:
@@ -759,12 +1137,22 @@ class ShowBragg(StaticFallbackMixin, anywidget.AnyWidget):
                 self._choose_basis()
             elif action == "run_fit":
                 self.fit()
+            elif action == "mark":
+                self.mark(float(content["row"]), float(content["col"]))
+            elif action == "teach":
+                self.teach()
+            elif action == "revert_teaching":
+                self.revert_teaching()
+            elif action == "save_model":
+                self.save_model(content.get("path") or None)
         except Exception as exc:
-            if not self.status:
+            if action in ("mark", "teach", "revert_teaching", "save_model"):
+                self.live_status = str(exc)
+            elif not self.status:
                 self.status = str(exc)
 
     def _static_png_b64(self, max_px: int = 512) -> str | None:
-        preview = self.bvm_png or self.probe_correlation_png or self.template_png
+        preview = self.bvm_png or self.pattern_png or self.template_png
         if not preview:
             return None
         return base64.b64encode(bytes(preview)).decode("ascii")
